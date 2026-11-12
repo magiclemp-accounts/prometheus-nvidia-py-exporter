@@ -1,10 +1,13 @@
 """Application exporter"""
 
+import logging
 import os
 import time
 
 import prometheus_client
 import pynvml
+
+logger = logging.getLogger(__name__)
 
 
 class AppMetrics:
@@ -54,13 +57,35 @@ class AppMetrics:
             "Memory used by MPS compute process",
             self.labels + ["process_id", "process_name"],
         )
+        self.collect_errors = prometheus_client.Counter(
+            "nvidia_collect_errors", "Number of NVML errors met while collecting metrics"
+        )
 
     def run_metrics_loop(self):
         """Metrics fetching loop"""
 
         while True:
-            self.fetch()
+            try:
+                self.fetch()
+            except pynvml.NVMLError as error:
+                # NVML errors are transient most of the time (process exiting,
+                # driver being reloaded...): keep the exporter alive, the
+                # previous values stay exposed until the next successful run.
+                self.collect_errors.inc()
+                logger.warning("NVML error while collecting metrics, keeping previous values: %s", error)
             time.sleep(self.polling_interval_seconds)
+
+    @staticmethod
+    def _process_name(pid):
+        """
+        Name of a process using the GPU, or "unknown" when NVML cannot give it:
+        a process that is exiting, or a zombie still holding a GPU context, makes
+        nvmlSystemGetProcessName raise NVMLError_NoData / NVMLError_NotFound.
+        """
+        try:
+            return pynvml.nvmlSystemGetProcessName(pid)
+        except pynvml.NVMLError:
+            return "unknown"
 
     def fetch(self):
         """
@@ -68,11 +93,12 @@ class AppMetrics:
         new values.
         """
         pynvml.nvmlInit()
-        self.num_devices = pynvml.nvmlDeviceGetCount()
+        num_devices = pynvml.nvmlDeviceGetCount()
+        self.num_devices.set(num_devices)
         self.compute_process_memory.clear()
         self.graphics_process_memory.clear()
         self.MPScompute_process_memory.clear()
-        for i in range(self.num_devices):
+        for i in range(num_devices):
             handle = pynvml.nvmlDeviceGetHandleByIndex(i)
             labels = [
                 pynvml.nvmlDeviceGetMinorNumber(handle),
@@ -89,21 +115,22 @@ class AppMetrics:
             self.fan_speed.labels(*labels).set(pynvml.nvmlDeviceGetFanSpeed(handle))
 
             for p in pynvml.nvmlDeviceGetComputeRunningProcesses(handle):
-                p_labels = [p.pid, pynvml.nvmlSystemGetProcessName(p.pid)]
-                self.compute_process_memory.labels(*labels, *p_labels).set(p.usedGpuMemory)
+                p_labels = [p.pid, self._process_name(p.pid)]
+                self.compute_process_memory.labels(*labels, *p_labels).set(p.usedGpuMemory or 0)
 
             for p in pynvml.nvmlDeviceGetGraphicsRunningProcesses(handle):
-                p_labels = [p.pid, pynvml.nvmlSystemGetProcessName(p.pid)]
-                self.graphics_process_memory.labels(*labels, *p_labels).set(p.usedGpuMemory)
+                p_labels = [p.pid, self._process_name(p.pid)]
+                self.graphics_process_memory.labels(*labels, *p_labels).set(p.usedGpuMemory or 0)
 
             for p in pynvml.nvmlDeviceGetMPSComputeRunningProcesses(handle):
-                p_labels = [p.pid, pynvml.nvmlSystemGetProcessName(p.pid)]
-                self.MPScompute_process_memory.labels(*labels, *p_labels).set(p.usedGpuMemory)
+                p_labels = [p.pid, self._process_name(p.pid)]
+                self.MPScompute_process_memory.labels(*labels, *p_labels).set(p.usedGpuMemory or 0)
 
 
 def main():
     """Main entry point"""
 
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     polling_interval_seconds = int(os.getenv("POLLING_INTERVAL_SECONDS", "5"))
     exporter_port = int(os.getenv("EXPORTER_PORT", "9102"))
 
